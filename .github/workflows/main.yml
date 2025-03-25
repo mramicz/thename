@@ -1,0 +1,110 @@
+name: Deploy to AWS Amplify
+on:
+  push:
+    branches:
+      - main  # or your default branch name
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build
+        run: npm run build
+
+      - name: Check/Create Amplify App
+        run: |
+          # Check if app exists
+          APP_ID=$(aws amplify list-apps --query "apps[?name=='${{ github.event.repository.name }}'].appId" --output text)
+          
+          if [ -z "$APP_ID" ]; then
+            echo "Creating new Amplify app..."
+            # Create new app
+            APP_ID=$(aws amplify create-app --name ${{ github.event.repository.name }} --query 'app.appId' --output text)
+            
+            # Create branch with Next.js configuration
+            aws amplify create-branch \
+              --app-id "$APP_ID" \
+              --branch-name "${{ github.ref_name }}" \
+              --stage PRODUCTION \
+              --enable-auto-build
+          fi
+          
+          echo "AMPLIFY_APP_ID=$APP_ID" >> $GITHUB_ENV
+
+      - name: Package and Upload
+        run: |
+          # Ensure the out directory exists
+          if [ ! -d "out" ]; then
+            echo "Error: 'out' directory not found. Make sure the build completed successfully."
+            exit 1
+          fi
+          
+          # Create deployment zip with build output
+          rm -f deployment.zip
+          cd out && zip -r ../deployment.zip . && cd ..
+          
+          # Verify zip was created
+          if [ ! -f "deployment.zip" ]; then
+            echo "Error: Failed to create deployment.zip"
+            exit 1
+          fi
+          
+          # Create S3 bucket for artifacts if it doesn't exist
+          BUCKET_NAME="${{ env.AMPLIFY_APP_ID }}-deploys"
+          aws s3 mb s3://$BUCKET_NAME --region ${{ secrets.AWS_REGION }} || true
+          
+          # Disable block public access settings
+          aws s3api put-public-access-block \
+            --bucket $BUCKET_NAME \
+            --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+          
+          # Update bucket policy to allow public read
+          aws s3api put-bucket-policy \
+            --bucket $BUCKET_NAME \
+            --policy "{
+              \"Version\": \"2012-10-17\",
+              \"Statement\": [
+                {
+                  \"Sid\": \"PublicReadForAmplifyDeployments\",
+                  \"Effect\": \"Allow\",
+                  \"Principal\": \"*\",
+                  \"Action\": \"s3:GetObject\",
+                  \"Resource\": \"arn:aws:s3:::$BUCKET_NAME/*\"
+                }
+              ]
+            }"
+          
+          # Upload to S3
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          S3_KEY="deployments/$TIMESTAMP/deployment.zip"
+          aws s3 cp deployment.zip s3://$BUCKET_NAME/$S3_KEY
+          
+          # Generate public HTTPS URL
+          S3_URL="https://$BUCKET_NAME.s3.${{ secrets.AWS_REGION }}.amazonaws.com/$S3_KEY"
+          echo "S3_ARTIFACT_URL=$S3_URL" >> $GITHUB_ENV
+
+      - name: Deploy to Amplify
+        run: |
+          aws amplify start-deployment \
+            --app-id ${{ env.AMPLIFY_APP_ID }} \
+            --branch-name ${{ github.ref_name }} \
+            --source-url ${{ env.S3_ARTIFACT_URL }}
